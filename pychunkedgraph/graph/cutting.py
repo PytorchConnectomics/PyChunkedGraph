@@ -1,4 +1,5 @@
 import collections
+import os
 import fastremap
 import numpy as np
 import itertools
@@ -615,6 +616,80 @@ class LocalMincutGraph:
             return True
 
 
+def robust_multicut_enabled() -> bool:
+    """cave-local: the robust fallback is on unless PCG_ROBUST_MULTICUT=0."""
+    return os.environ.get("PCG_ROBUST_MULTICUT", "1").lower() not in ("0", "false", "no", "off")
+
+
+def robust_mincut(
+    edges: np.ndarray,
+    affinities: np.ndarray,
+    source_ids: Sequence[np.uint64],
+    sink_ids: Sequence[np.uint64],
+) -> np.ndarray:
+    """Minimum cut separating every source from every sink, with no connectivity requirement.
+
+    cave-local fallback for multicuts the path-augmented mincut refuses or fails: sources are
+    tied to one super-source and sinks to one super-sink with uncuttable edges; edge capacity is
+    the affinity. Either side may end up in several pieces (gaps allowed). Infinite-affinity
+    edges (one supervoxel across a chunk seam) are never cut. Returns the cut edges, as rows of
+    `edges` (every stored orientation), ready for edits.remove_edges.
+    """
+    edges = np.asarray(edges, dtype=basetypes.NODE_ID).reshape(-1, 2)
+    affinities = np.asarray(affinities, dtype=np.float64)
+    sources = np.unique(np.asarray(source_ids, dtype=basetypes.NODE_ID))
+    sinks = np.unique(np.asarray(sink_ids, dtype=basetypes.NODE_ID))
+    if np.any(np.isin(sources, sinks)):
+        raise PreconditionError("Supervoxels exist in both sink and source.")
+    nodes, inverse = np.unique(edges, return_inverse=True)
+    if not (np.all(np.isin(sources, nodes)) and np.all(np.isin(sinks, nodes))):
+        raise PreconditionError("Split points are not on edges of the local graph.")
+    pairs = inverse.reshape(-1, 2)
+    finite = np.isfinite(affinities)
+    caps = np.where(finite, np.clip(affinities, 1e-6, None), 0.0)
+    # Larger than any finite cut: such an edge is cut only if nothing else separates the sides.
+    uncuttable = float(caps.sum()) * 2 + 1.0
+    caps = np.where(finite, caps, uncuttable)
+
+    n = len(nodes)
+    s, t = n, n + 1
+    src_ix = np.searchsorted(nodes, sources)
+    snk_ix = np.searchsorted(nodes, sinks)
+    graph = graph_tool.Graph(directed=True)
+    graph.add_vertex(n + 2)
+    all_pairs = np.concatenate(
+        [
+            pairs,
+            pairs[:, ::-1],
+            np.stack([np.full(len(src_ix), s), src_ix], 1),
+            np.stack([snk_ix, np.full(len(snk_ix), t)], 1),
+        ]
+    )
+    all_caps = np.concatenate(
+        [caps, caps, np.full(len(src_ix), uncuttable), np.full(len(snk_ix), uncuttable)]
+    )
+    graph.add_edge_list(all_pairs)
+    capacity = graph.new_edge_property("double", vals=all_caps)
+    residual = graph_tool.flow.boykov_kolmogorov_max_flow(
+        graph, graph.vertex(s), graph.vertex(t), capacity
+    )
+    out = [int(graph.edge_index[e]) for e in graph.vertex(s).out_edges()]
+    flow = float((capacity.a[out] - residual.a[out]).sum())
+    if flow >= uncuttable:
+        raise PostconditionError(
+            "The source and sink points can only be separated by cutting inside one supervoxel "
+            "(it spans a chunk seam). Place the points on different supervoxels."
+        )
+    partition = graph_tool.flow.min_st_cut(graph, graph.vertex(s), capacity, residual)
+    side = partition.a[:n].astype(bool)
+    crossing = side[pairs[:, 0]] != side[pairs[:, 1]]
+    return edges[crossing & finite]
+
+
+# Refusals and failures of the path-augmented mincut that the robust mincut can resolve.
+ROBUST_FALLBACK_ERRORS = (PreconditionError, PostconditionError, IsolatingCutException, AssertionError)
+
+
 def run_multicut(
     edges: Edges,
     source_ids: Sequence[np.uint64],
@@ -623,20 +698,37 @@ def run_multicut(
     split_preview: bool = False,
     path_augment: bool = True,
     disallow_isolating_cut: bool = True,
+    robust: Optional[bool] = None,
 ):
-    local_mincut_graph = LocalMincutGraph(
-        edges.get_pairs(),
-        edges.affinities,
-        source_ids,
-        sink_ids,
-        split_preview,
-        path_augment,
-        disallow_isolating_cut=disallow_isolating_cut,
-    )
-    atomic_edges = local_mincut_graph.compute_mincut()
-    if len(atomic_edges) == 0:
-        raise PostconditionError(f"Mincut failed. Try with a different set of points.")
-    return atomic_edges
+    """Upstream path-augmented mincut first; for a real edit (not a preview) whose mincut is
+    refused or fails, cave-local falls back to robust_mincut (see there)."""
+    robust = robust_multicut_enabled() if robust is None else robust
+    try:
+        local_mincut_graph = LocalMincutGraph(
+            edges.get_pairs(),
+            edges.affinities,
+            source_ids,
+            sink_ids,
+            split_preview,
+            path_augment,
+            disallow_isolating_cut=disallow_isolating_cut,
+        )
+        atomic_edges = local_mincut_graph.compute_mincut()
+        if len(atomic_edges) == 0:
+            raise PostconditionError(f"Mincut failed. Try with a different set of points.")
+        return atomic_edges
+    except ROBUST_FALLBACK_ERRORS as upstream_error:
+        if split_preview or not robust:
+            raise
+        logging.getLogger(__name__).info("robust multicut fallback after: %s", upstream_error)
+        atomic_edges = robust_mincut(
+            edges.get_pairs(), edges.affinities, source_ids, sink_ids
+        )
+        if len(atomic_edges) == 0:
+            raise PostconditionError(
+                "The source and sink points are not connected in the local graph; nothing to cut."
+            )
+        return atomic_edges
 
 
 def run_split_preview(
