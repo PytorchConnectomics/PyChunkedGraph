@@ -162,8 +162,23 @@ class LocalMincutGraph:
             self.weighted_graph_raw,
             self.capacities_raw,
             self.gt_edges_raw,
-            _,
+            raw_supervoxel_ids,
         ) = flatgraph.build_gt_graph(edges, affs, make_directed=True)
+
+        # cave-local: source/sink graph ids index the combined graph below (edges plus the fake
+        # source/sink edges) and are reused on the raw graph. A source or sink with no local edge
+        # exists only in the combined graph, which shifts every later id: the raw graph then gets
+        # the wrong terminals or an invalid vertex index. Refuse such terminals as a precondition.
+        isolated = np.setdiff1d(
+            np.concatenate([self.sources, self.sinks]).astype(np.uint64),
+            np.asarray(raw_supervoxel_ids, dtype=np.uint64),
+        )
+        if len(isolated):
+            raise PreconditionError(
+                "Some source or sink supervoxels have no edges in the local graph "
+                f"({', '.join(map(str, isolated[:5].tolist()))}). "
+                "Place the points on supervoxels connected to the object near the cut."
+            )
 
         self.source_edges = list(itertools.product(self.sources, self.sources))
         self.sink_edges = list(itertools.product(self.sinks, self.sinks))

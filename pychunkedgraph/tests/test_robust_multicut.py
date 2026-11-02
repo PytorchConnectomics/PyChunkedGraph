@@ -76,3 +76,23 @@ def test_in2d_accepts_transposed_arrays():
     b = np.array([[1, 3], [2, 4]], dtype=np.uint64).T  # rows (1, 2), (3, 4); not C-contiguous
     assert not b.flags["C_CONTIGUOUS"]
     assert in2d(a, b).tolist() == [True, True]
+
+
+# cave-local: a terminal with no local edge used to shift the raw-graph vertex ids of every later
+# terminal (wrong terminals, or "Invalid vertex index"). It is now a precondition failure; the robust
+# fallback of a real edit refuses such points too, with a message instead of a crash.
+@pytest.mark.parametrize("sources", [[10, 99], [5, 10]])
+def test_isolated_terminal_is_a_precondition_not_a_shifted_vertex(sources):
+    from pychunkedgraph.graph.cutting import LocalMincutGraph
+    from pychunkedgraph.graph.exceptions import PreconditionError
+
+    edges = _edges([[10, 20], [20, 30], [30, 40], [40, 50]], [0.9, 0.9, 0.1, 0.9])
+    with pytest.raises(PreconditionError, match="no edges in the local graph"):
+        LocalMincutGraph(
+            edges.get_pairs(), edges.affinities, _ids(*sources), _ids(50), False, True,
+            disallow_isolating_cut=True,
+        )
+    with pytest.raises(PreconditionError, match="not on edges of the local graph"):
+        run_multicut(edges, _ids(*sources), _ids(50), robust=True)
+    with pytest.raises(PreconditionError):
+        run_multicut(edges, _ids(*sources), _ids(50), split_preview=True)
